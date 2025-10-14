@@ -1,107 +1,156 @@
+import numpy as np
 from scipy.stats import poisson
-import math
 
-K = 20
-states = [(i, j) for i in range(K+1) for j in range(K+1)]
-state_to_idx = {s: idx for idx, s in enumerate(states)}
-N_STATES = len(states)
-
+# --- Problem constants ---
+K = 20                          # capacity per lot
 gamma = 0.9
 move_cost = 2.0
 rent_reward = 10.0
 
-# Poisson distributions
-R1 = poisson(mu=3)  # requests loc1
-R2 = poisson(mu=4)  # requests loc2
-B1 = poisson(mu=3)  # returns  loc1
-B2 = poisson(mu=2)  # returns  loc2
+# Poisson rates: requests then returns
+lam_r1, lam_r2 = 3, 4
+lam_b1, lam_b2 = 3, 2
 
-# truncate tails for loops
-TAIL = 15  # safe; you can tune
+# Truncation tail beyond capacity (safe & fast)
+TAIL = 15
 R1_MAX = K + TAIL
 R2_MAX = K + TAIL
 B1_MAX = K + TAIL
 B2_MAX = K + TAIL
+EPS = 1e-12  # ignore tiny probabilities
 
-def clamp(x, lo, hi): 
-    return max(lo, min(hi, x))
+# --- Helpers ---
+def clamp(x, lo, hi):
+    return lo if x < lo else (hi if x > hi else x)
 
 def feasible_actions(i, j):
-    # Max 5 moved; also cannot move more than available at origin
-    # We’ll clamp after applying the move, so this bound suffices:
-    lo = -min(5, j)   # negative = move from loc2 -> loc1
-    hi =  min(5, i)   # positive = move from loc1 -> loc2
-    return range(lo, hi+1)
+    lo = -min(5, j)  # negative: move from loc2->loc1
+    hi =  min(5, i)  # positive: move from loc1->loc2
+    return range(lo, hi + 1)
 
-def E_min_poisson(n, pmf, cdf):
-    # E[min(R, n)]  (works for n >= 0)
-    if n <= 0: 
-        return 0.0
-    s = 0.0
-    # sum_{k=0}^{n-1} k * P(R=k)
-    for k in range(n):
-        s += k * pmf(k)
-    # + n * P(R >= n)
-    s += n * (1.0 - cdf(n-1))
-    return s
+def E_min_poisson_table(K, dist):
+    # Table t[n] = E[min(R, n)] for n in 0..K
+    pmf = dist.pmf(np.arange(0, K+1))  # we only need up to K for this expectation
+    cdf = dist.cdf(np.arange(0, K+1))
+    t = np.zeros(K+1, dtype=float)
+    # E[min(R,n)] = sum_{k=0}^{n-1} k*P(R=k) + n * P(R >= n)
+    # compute prefix sums of k*pmf for speed
+    ks = np.arange(0, K+1, dtype=float)
+    kpmf_prefix = np.cumsum(ks * pmf)  # length K+1, at index n gives sum_{k<=n} k*P(k)
+    for n in range(1, K+1):
+        sum_k = kpmf_prefix[n-1]          # sum_{k=0}^{n-1} k*P(k)
+        tail = 1.0 - cdf[n-1]             # P(R >= n)
+        t[n] = sum_k + n * tail
+    return t
 
-# precompute E[min(R, n)] tables
-Emin_R1 = [E_min_poisson(n, R1.pmf, R1.cdf) for n in range(K+1)]
-Emin_R2 = [E_min_poisson(n, R2.pmf, R2.cdf) for n in range(K+1)]
+def truncated_pmf(dist, max_k):
+    arr = dist.pmf(np.arange(0, max_k+1))
+    arr[arr < EPS] = 0.0
+    # No renormalization: any leftover tail probability beyond max_k will be absorbed by capacity clamp later
+    return arr
 
-# deterministic policy per state (e.g., start with "move 0")
-policy = [0 for _ in range(N_STATES)]
+# --- Precompute expectations for rewards ---
+R1 = poisson(mu=lam_r1)
+R2 = poisson(mu=lam_r2)
+Emin_R1 = E_min_poisson_table(K, R1)  # E[min(requests1, n)]
+Emin_R2 = E_min_poisson_table(K, R2)  # E[min(requests2, n)]
 
-V = [0.0 for _ in range(N_STATES)]
-theta = 1e-4
+# --- Precompute PMFs (truncated) for requests and returns ---
+pmf_r1 = truncated_pmf(R1, R1_MAX)  # shape (R1_MAX+1,)
+pmf_r2 = truncated_pmf(R2, R2_MAX)
+pmf_b1 = truncated_pmf(poisson(mu=lam_b1), B1_MAX)
+pmf_b2 = truncated_pmf(poisson(mu=lam_b2), B2_MAX)
+
+# Precompute index lists where pmf > 0 to skip zeros
+idx_r1 = np.flatnonzero(pmf_r1)
+idx_r2 = np.flatnonzero(pmf_r2)
+idx_b1 = np.flatnonzero(pmf_b1)
+idx_b2 = np.flatnonzero(pmf_b2)
+
+# --- Precompute 1D transition kernels T1, T2 ---
+# T1[i_prime, x] = P(i_next = x | start i_prime)
+# T2[j_prime, y] = P(j_next = y | start j_prime)
+T1 = np.zeros((K+1, K+1), dtype=float)
+T2 = np.zeros((K+1, K+1), dtype=float)
+
+# Single-location kernel builder (requests ~ pmf_r, returns ~ pmf_b)
+def build_kernel_single(K, pmf_r, idx_r, pmf_b, idx_b):
+    T = np.zeros((K+1, K+1), dtype=float)
+    for n in range(K+1):  # morning stock n
+        row = np.zeros(K+1, dtype=float)
+        for r in idx_r:
+            pr = pmf_r[r]
+            f = r if r <= n else n                # fulfilled rentals = min(r, n)
+            remain = n - f
+            for b in idx_b:
+                pb = pmf_b[b]
+                nxt = remain + b
+                nxt = K if nxt > K else nxt       # clamp to capacity
+                row[nxt] += pr * pb
+        # tiny numerical drift fix: normalize row to sum <= 1 (remaining tail mass goes to K anyway)
+        s = row.sum()
+        if s > 0:
+            row /= s
+        T[n, :] = row
+    return T
+
+T1 = build_kernel_single(K, pmf_r1, idx_r1, pmf_b1, idx_b1)
+T2 = build_kernel_single(K, pmf_r2, idx_r2, pmf_b2, idx_b2)
+
+# --- Value Iteration (fast) ---
+V = np.zeros((K+1, K+1), dtype=float)  # V[i, j]
+theta = 1e-3
 
 while True:
     delta = 0.0
-    for idx, (i, j) in enumerate(states):
-        a = policy[idx]
+    V_new = V.copy()
 
-        # clamp inventories after moving overnight
-        i_prime = clamp(i - a, 0, K)
-        j_prime = clamp(j + a, 0, K)
+    # precompute right multiplies to reuse: for each j' we’ll need V @ T2[j'] (or its transpose)
+    # We'll compute EV_next(i', j') = (T1[i'] @ V @ T2[j']^T)
+    # Code uses: tmp = V @ T2[j_prime], then EV_next = T1[i_prime] @ tmp
+    VT2 = V @ T2.T   # shape (K+1, K+1) where column j' gives sum_y V[:,y]*P2(y|j')
 
-        # expected immediate reward (movement cost + expected rental revenue)
-        immediate = -move_cost * abs(a)
-        immediate += rent_reward * (Emin_R1[i_prime] + Emin_R2[j_prime])
+    for i in range(K+1):
+        for j in range(K+1):
 
-        # expected V of next state via requests & returns
-        EV_next = 0.0
-        # loop over requests
-        for r1 in range(R1_MAX + 1):
-            p_r1 = R1.pmf(r1)
-            if p_r1 < 1e-12: 
-                continue
-            for r2 in range(R2_MAX + 1):
-                p_r2 = R2.pmf(r2)
-                if p_r2 < 1e-12:
-                    continue
+            best = -np.inf
+            for a in feasible_actions(i, j):
+                i_prime = clamp(i - a, 0, K)
+                j_prime = clamp(j + a, 0, K)
 
-                f1 = min(r1, i_prime)  # fulfilled at loc1
-                f2 = min(r2, j_prime)  # fulfilled at loc2
+                # expected immediate reward
+                immediate = -move_cost * abs(a)
+                immediate += rent_reward * (Emin_R1[i_prime] + Emin_R2[j_prime])
 
-                # loop over returns
-                for b1 in range(B1_MAX + 1):
-                    p_b1 = B1.pmf(b1)
-                    if p_b1 < 1e-12:
-                        continue
-                    for b2 in range(B2_MAX + 1):
-                        p_b2 = B2.pmf(b2)
-                        if p_b2 < 1e-12:
-                            continue
+                # expected next value via bilinear form:
+                # EV_next = T1[i_prime,:] @ (V @ T2[j_prime,:]^T)
+                EV_next = T1[i_prime, :].dot(VT2[:, j_prime])
 
-                        i_next = clamp(i_prime - f1 + b1, 0, K)
-                        j_next = clamp(j_prime - f2 + b2, 0, K)
-                        p = p_r1 * p_r2 * p_b1 * p_b2
-                        EV_next += p * V[state_to_idx[(i_next, j_next)]]
+                val = immediate + gamma * EV_next
+                if val > best:
+                    best = val
 
-        v_old = V[idx]
-        V[idx] = immediate + gamma * EV_next
-        delta = max(delta, abs(v_old - V[idx]))
-        print(delta)
+            V_new[i, j] = best
+            delta = max(delta, abs(best - V[i, j]))
 
+    V = V_new
     if delta < theta:
         break
+
+# (Optional) derive greedy policy arrows
+def greedy_action(i, j, V, T1, T2):
+    best_a, best_val = 0, -np.inf
+    VT2 = V @ T2.T
+    for a in feasible_actions(i, j):
+        i_prime = clamp(i - a, 0, K)
+        j_prime = clamp(j + a, 0, K)
+        immediate = -move_cost * abs(a) + rent_reward * (Emin_R1[i_prime] + Emin_R2[j_prime])
+        EV_next = T1[i_prime, :].dot(VT2[:, j_prime])
+        val = immediate + gamma * EV_next
+        if val > best_val:
+            best_val, best_a = val, a
+    return best_a
+
+# Example: print a small slice of V and a few greedy actions
+print(np.round(V[:6, :6], 1))
+print([greedy_action(10, j, V, T1, T2) for j in range(0, 21, 5)])
